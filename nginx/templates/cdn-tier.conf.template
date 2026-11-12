@@ -1,0 +1,69 @@
+# One caching tier of SeatWave's CDN stand-in: the edge and the shield use this same file, with
+# TIER_NAME, UPSTREAM and STATUS_HEADER from compose.yaml (the image's entrypoint substitutes only
+# variables that are set, so NGINX's own $variables are left alone). Every directive was checked
+# against nginx.org/en/docs for the 1.30 line on 12 November 2026. Check with: nginx -t
+
+# Keys in 10 MB of shared memory (about 80,000 keys), bodies up to 900 MB on the tier's 1 GB tmpfs
+# (the rest is room for NGINX's temporary files).
+proxy_cache_path /var/cache/nginx/cdn levels=1:2 keys_zone=cdn_tier:10m max_size=900m
+                 inactive=7d use_temp_path=off;
+
+# msec is when the line was written; msec minus rt is when the request arrived (the lock probe).
+log_format cdn_tier 'tier=${TIER_NAME} time=$time_iso8601 msec=$msec status=$status '
+                    'cache=$upstream_cache_status rt=$request_time bytes=$bytes_sent uri=$request_uri';
+
+upstream next_tier {
+    server ${UPSTREAM};
+    # Warm connections to the next tier: a miss pays one round trip, not a new handshake.
+    keepalive 16;
+}
+
+server {
+    listen 8080;
+    access_log /var/log/nginx/access.log cdn_tier;
+    server_tokens off;
+
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_set_header Host $host;
+    # The origin answers only requests that carry the shared secret (scripts/stack.sh writes this
+    # file into the ignored .secrets/ folder at start). proxy_set_header replaces any value a
+    # client sent, so the secret cannot be guessed through the tier, and it is never logged.
+    include /etc/seatwave-secret/origin-secret.conf;
+
+    proxy_cache cdn_tier;
+    # Scheme, host, path and query: nothing else changes SeatWave's static answers, so nothing
+    # else is in the key, and no request header is passed that could change the body unkeyed.
+    proxy_cache_key "$scheme://$host$request_uri";
+    proxy_cache_methods GET HEAD;
+    # No proxy_cache_valid: a response is stored only if its own Cache-Control gives a lifetime.
+    # NGINX also never stores private, no-store, no-cache or a Set-Cookie response.
+    # One request fills a missing entry; the others wait for it (Section 5e).
+    proxy_cache_lock on;
+    proxy_cache_lock_timeout 5s;
+    # Stale entries are checked with If-None-Match / If-Modified-Since, so a 304 costs no body.
+    proxy_cache_revalidate on;
+    # The header's stale-while-revalidate is honored; one background request refreshes.
+    proxy_cache_use_stale updating;
+    proxy_cache_background_update on;
+    # A request with credentials is neither answered from nor stored in the cache.
+    proxy_no_cache $http_authorization;
+    proxy_cache_bypass $http_authorization;
+    add_header ${STATUS_HEADER} $upstream_cache_status always;
+
+    # The API (seat maps, holds, bookings, tokens) is never stored here, whatever header it has.
+    location /v1/ {
+        proxy_no_cache 1;
+        proxy_cache_bypass 1;
+        proxy_pass http://next_tier;
+    }
+
+    # The origin's counters and deploy are for the lab only, never reachable through a tier.
+    location ^~ /_origin/ {
+        return 404;
+    }
+
+    location / {
+        proxy_pass http://next_tier;
+    }
+}

@@ -1,0 +1,14 @@
+.gradle/
+build/
+out/
+*.log
+.DS_Store
+.idea/
+*.iml
+.env
+# The origin's shared secret is generated into .secrets on every "scripts/stack.sh up" and never
+# committed. Not under build/: "./gradlew clean" would delete it while the stack still reads it.
+.secrets/
+# The 300,000-byte poster stand-in is written by ./gradlew prepareSampleSite, never committed.
+site/static/poster-arena.jpg
+site/share/

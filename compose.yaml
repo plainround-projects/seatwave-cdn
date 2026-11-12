@@ -1,0 +1,120 @@
+# SeatWave's CDN stand-in (Module 17): an NGINX edge in front of an NGINX shield in front of the
+# Java static origin. Images pinned by tag and digest, checked on Docker Hub on 12 November 2026:
+# nginx:1.30.6 (the stable line, Debian trixie; 1.31.8 is mainline) and the Temurin 25.0.5 JRE,
+# both Docker Official Images with arm64 and amd64 variants. Ports 21700 to 21702 of Module 17's
+# range 21700 to 21799, published on 127.0.0.1 only. Nothing runs privileged, nothing uses the
+# host network or the Docker socket, and the only folders mounted are this project's build/stack,
+# build/dist, nginx/templates and .secrets, read-only.
+# Start and stop it with scripts/stack.sh, which builds build/stack and build/dist, writes the
+# origin's secret into .secrets/, and brings everything down with "down -v".
+name: seatwave-cdn
+
+x-nginx-image: &nginx-image nginx:1.30.6@sha256:42c68eab6f7e22611786a9fe1d1c019e275c50185bd54b8f75dc2b9184322703
+
+x-hardening: &hardening
+  read_only: true
+  security_opt:
+    - no-new-privileges:true
+
+# NGINX's master starts as root to switch its workers to the nginx user and to hand them the
+# cache folders: those three capabilities, nothing else.
+x-nginx-tier: &nginx-tier
+  <<: *hardening
+  image: *nginx-image
+  cap_drop:
+    - ALL
+  cap_add:
+    - CHOWN
+    - SETGID
+    - SETUID
+  cpus: 1
+  # The tmpfs pages count against this limit only as the cache fills; the cache stops at 900m.
+  mem_limit: 1280m
+
+services:
+  origin:
+    <<: *hardening
+    image: eclipse-temurin:25.0.5_8-jre-noble@sha256:e3b6f7887a50f20d8f07abf279d8a81a5953fb398a9555bd9edd56b9bd15968c
+    # An ordinary user without a login: 10001 is above Ubuntu's system range (up to 999).
+    user: "10001:10001"
+    cap_drop:
+      - ALL
+    command:
+      - java
+      - -XX:MaxRAMPercentage=50
+      - -cp
+      - /app/lib/*
+      - io.plainround.seatwave.cdn.origin.OriginServer
+      - /app/dist
+      - "21700"
+      - 0.0.0.0
+      - /etc/seatwave-secret/origin-secret
+    volumes:
+      - ./build/stack/lib:/app/lib:ro
+      - ./build/dist:/app/dist:ro
+      - ./.secrets:/etc/seatwave-secret:ro
+    tmpfs:
+      - /tmp:size=64m
+    ports:
+      - "127.0.0.1:21700:21700"
+    # Module 1's reference machine gives the static origin one core in this lab.
+    cpus: 1
+    mem_limit: 512m
+
+  shield:
+    <<: *nginx-tier
+    environment:
+      TIER_NAME: shield
+      UPSTREAM: origin:21700
+      STATUS_HEADER: X-Shield-Cache-Status
+    volumes:
+      - ./nginx/templates:/etc/nginx/templates:ro
+      - ./.secrets:/etc/seatwave-secret:ro
+    # The cache lives in memory, so a restart is a purge of everything: a cold tier (Section 9).
+    # conf.d receives the rendered template; /run holds NGINX's pid file.
+    tmpfs:
+      - /var/cache/nginx:size=1g
+      - /etc/nginx/conf.d:size=1m
+      - /run:size=1m
+    ports:
+      - "127.0.0.1:21702:8080"
+    depends_on:
+      - origin
+
+  edge:
+    <<: *nginx-tier
+    environment:
+      TIER_NAME: edge
+      UPSTREAM: shield:8080
+      STATUS_HEADER: X-Cache-Status
+    volumes:
+      - ./nginx/templates:/etc/nginx/templates:ro
+      - ./.secrets:/etc/seatwave-secret:ro
+    tmpfs:
+      - /var/cache/nginx:size=1g
+      - /etc/nginx/conf.d:size=1m
+      - /run:size=1m
+    ports:
+      - "127.0.0.1:21701:8080"
+    depends_on:
+      - shield
+
+  # The load client inside the stack's network, so the origin's capacity can be measured without
+  # Docker Desktop's port forwarder in the way: docker compose -p seatwave-cdn run --rm load <args>.
+  # Only started on demand (profile "tools"); it publishes no port.
+  load:
+    <<: *hardening
+    image: eclipse-temurin:25.0.5_8-jre-noble@sha256:e3b6f7887a50f20d8f07abf279d8a81a5953fb398a9555bd9edd56b9bd15968c
+    profiles:
+      - tools
+    user: "10001:10001"
+    cap_drop:
+      - ALL
+    entrypoint: ["java", "-cp", "/app/lib/*", "io.plainround.seatwave.cdn.load.EdgeLoadClient"]
+    volumes:
+      - ./build/stack/lib:/app/lib:ro
+      - ./.secrets:/etc/seatwave-secret:ro
+    tmpfs:
+      - /tmp:size=64m
+    cpus: 4
+    mem_limit: 1g
